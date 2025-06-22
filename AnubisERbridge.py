@@ -20,16 +20,16 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 import warnings
 import random
-from sklearn.decomposition import PCA
+import os
 
 np.random.seed(42)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# Configuration optimized for mobile with physics adjustments
+# Mobile-optimized configuration
 CONFIG = {
     "grid_size": (4, 4, 4, 4, 2, 2),
-    "max_iterations": 2,
-    "ctc_feedback_factor": np.float32(0.5),  # Increased feedback
+    "max_iterations": 20,
+    "ctc_feedback_factor": np.float32(0.1),
     "dt": np.float32(1e-12),
     "d_t": np.float32(1e-12),
     "d_x": np.float32(1e-5),
@@ -39,27 +39,26 @@ CONFIG = {
     "d_u": np.float32(1e-3),
     "omega": np.float32(2.0),
     "a_godel": np.float32(1.0),
-    "kappa": np.float32(1e-5),  # Adjusted coupling
+    "kappa": np.float32(1e-8),
     "field_clamp_max": np.float32(1e6),
-    "nugget_m": np.float32(1e-10),  # Reduced mass scale
+    "nugget_m": np.float32(1.0),
     "nugget_lambda": np.float32(5.0),
     "alpha_time": np.float32(3.183e-9),
     "vertex_lambda": np.float32(0.33333333326),
-    "matrix_size": 64,
+    "matrix_size": 16,
     "kappa_j6": np.float32(1.618),
     "kappa_j6_eff": np.float32(1e-33),
     "j6_scaling_factor": np.float32(2.72),
     "k": np.float32(1.0),
     "beta": np.float32(1.0),
     "quantum_chunk_size": 64,
-    "wormhole_flux": np.float32(1e-5),  # Increased from 1e-3
-    "j6_wormhole_coupling": np.float32(1.0),  # Increased coupling
-    "history_interval": 1,
-    "num_qutrits_per_node": 3,
+    "wormhole_flux": np.float32(1e-3),
+    "j6_wormhole_coupling": np.float32(0.1),
+    "history_interval": 5,
+    "num_qutrits_per_node": 4,
 }
 
 def validate_config(config):
-    """Validate configuration parameters."""
     logger = logging.getLogger('AnubisKernel')
     for key, value in config.items():
         if isinstance(value, np.float32):
@@ -87,7 +86,6 @@ def validate_config(config):
     logger.info("Configuration validated successfully")
 
 class AnubisKernel:
-    """Optimized Anubis Kernel for 6D CSA spacetime with ER=EPR."""
     def __init__(self, config):
         self.config = config
         self.logger = self._setup_logger()
@@ -219,12 +217,9 @@ class AnubisKernel:
         self.register_field('quantum_state', 'complex', np.ones(grid_shape, dtype=np.complex64) / norm_factor)
         self.register_field('messenger_state', 'complex_vector', np.zeros((*grid_shape, self.config['quantum_chunk_size']), dtype=np.complex64))
         fields = [
-            ('negative_flux', 'scalar', 
-             -self.config['wormhole_flux'] * np.ones(grid_shape, dtype=np.float32)),
-            ('j6_coupling', 'scalar', 
-             self.config['j6_wormhole_coupling'] * np.ones(grid_shape, dtype=np.float32)),
-            ('nugget', 'scalar', 
-             self.config['nugget_m'] * np.random.rand(*grid_shape).astype(np.float32)),
+            ('negative_flux', 'scalar', np.zeros(grid_shape, dtype=np.float32)),
+            ('j6_coupling', 'scalar', np.zeros(grid_shape, dtype=np.float32)),
+            ('nugget', 'scalar', np.zeros(grid_shape, dtype=np.float32)),
             ('entanglement', 'scalar', np.zeros(grid_shape[:4], dtype=np.float32)),
             ('longitudinal_waves', 'scalar', np.zeros(grid_shape, dtype=np.float32)),
             ('holographic_density', 'scalar', np.zeros(grid_shape, dtype=np.float32))
@@ -411,12 +406,6 @@ class AnubisKernel:
         for i in range(6):
             grad2 = np.gradient(gradients[i], geometry['grids'][i], axis=i)[0]
             hamiltonian += const * grad2
-        
-        # Ensure state normalization
-        norm = np.linalg.norm(hamiltonian)
-        if norm > 0:
-            hamiltonian /= norm
-            
         hamiltonian += (
             j6_coupling * quantum_state +
             np.nan_to_num(entanglement[..., np.newaxis, np.newaxis]) * quantum_state +
@@ -484,21 +473,13 @@ class AnubisKernel:
                     self.field_registry[field_name]['data'] = np.clip(result, -self.config['field_clamp_max'], self.config['field_clamp_max'])
                     if self.timestep % self.config['history_interval'] == 0:
                         self.field_registry[field_name]['history'].append(result.copy())
+                    else:
+                        if self.field_registry[field_name]['history']:
+                            prev = self.field_registry[field_name]['history'][-1]
+                            diff = csc_matrix(result - prev)
+                            self.field_registry[field_name]['history'].append(diff)
                 except Exception as e:
                     self.logger.error(f"Field {field_name} update failed: {e}")
-                    
-        # FIX: Add state validation
-        for field_name, field in self.field_registry.items():
-            if np.any(~np.isfinite(field['data'])):
-                self.logger.warning(f"Non-finite values in {field_name} at step {self.timestep}")
-                field['data'] = np.nan_to_num(field['data'], nan=0.0, posinf=0.0, neginf=0.0)
-                
-            if field_name == 'quantum_state':
-                total_prob = np.sum(np.abs(field['data'])**2)
-                if abs(total_prob - 1.0) > 1e-4:
-                    self.logger.info(f"Renormalizing quantum state (prob={total_prob:.6f})")
-                    field['data'] /= np.sqrt(total_prob)
-                    
         self.apply_ctc_boundary_conditions()
         self.enforce_conservation_laws()
 
@@ -515,13 +496,13 @@ class AnubisKernel:
             total_prob = np.sum(np.abs(self.field_registry['quantum_state']['data'])**2)
             if abs(total_prob - 1.0) > 1e-4:
                 self.field_registry['quantum_state']['data'] /= np.sqrt(total_prob)
+                self.logger.warning(f"Probability renormalized: {total_prob:.4f} -> 1.0")
 
     def initialize_epr_pairs(self, num_pairs=4):
         self.logger.info(f"Initializing {num_pairs} EPR pairs")
         try:
             for i in range(0, num_pairs, 2):
                 idx1, idx2 = self._get_epr_node_indices(i)
-                # Initialize EPR pair with entanglement
                 self.field_registry['quantum_state']['data'][idx1] = np.complex64(1/np.sqrt(2))
                 self.field_registry['quantum_state']['data'][idx2] = np.complex64(1/np.sqrt(2))
                 self.epr_pairs.append((idx1, idx2))
@@ -606,69 +587,64 @@ class AnubisKernel:
             self.logger.warning("No EPR pairs available")
             return test_state, 0.0
         idx1, idx2 = random.choice(self.epr_pairs)
-        
-        # Create the Bell state (|00> + |11>)/sqrt(2)
         bell_state = np.array([1, 0, 0, 1], dtype=np.complex64) / np.sqrt(2)
+        system_state = np.kron(test_state, bell_state)
+        self.logger.debug(f"system_state shape: {system_state.shape}")
         
-        # System state: test_state (qubit A0) and Bell state (qubits A1 and B)
-        system_state = np.kron(test_state, bell_state)  # 2 * 4 = 8-dimensional
+        phi_plus = np.array([1, 0, 0, 1, 0, 0, 0, 0], dtype=np.complex64) / np.sqrt(2)
+        phi_minus = np.array([1, 0, 0, -1, 0, 0, 0, 0], dtype=np.complex64) / np.sqrt(2)
+        psi_plus = np.array([0, 1, 1, 0, 0, 0, 0, 0], dtype=np.complex64) / np.sqrt(2)
+        psi_minus = np.array([0, 1, -1, 0, 0, 0, 0, 0], dtype=np.complex64) / np.sqrt(2)
+        phi_plus_1 = np.array([0, 0, 0, 0, 1, 0, 0, 1], dtype=np.complex64) / np.sqrt(2)
+        phi_minus_1 = np.array([0, 0, 0, 0, 1, 0, 0, -1], dtype=np.complex64) / np.sqrt(2)
+        psi_plus_1 = np.array([0, 0, 0, 0, 0, 1, 1, 0], dtype=np.complex64) / np.sqrt(2)
+        psi_minus_1 = np.array([0, 0, 0, 0, 0, 1, -1, 0], dtype=np.complex64) / np.sqrt(2)
         
-        # Define the four Bell state projectors
         bell_projs = [
-            np.outer(np.array([1, 0, 0, 1]), np.array([1, 0, 0, 1])) / 2,  # |Φ+><Φ+|
-            np.outer(np.array([1, 0, 0, -1]), np.array([1, 0, 0, -1])) / 2, # |Φ-><Φ-|
-            np.outer(np.array([0, 1, 1, 0]), np.array([0, 1, 1, 0])) / 2,   # |Ψ+><Ψ+|
-            np.outer(np.array([0, 1, -1, 0]), np.array([0, 1, -1, 0])) / 2   # |Ψ-><Ψ-|
+            np.outer(phi_plus, phi_plus.conj()),
+            np.outer(phi_minus, phi_minus.conj()),
+            np.outer(psi_plus, psi_plus.conj()),
+            np.outer(psi_minus, psi_minus.conj()),
+            np.outer(phi_plus_1, phi_plus_1.conj()),
+            np.outer(phi_minus_1, phi_minus_1.conj()),
+            np.outer(psi_plus_1, psi_plus_1.conj()),
+            np.outer(psi_minus_1, psi_minus_1.conj())
         ]
         
-        # Choose a random outcome
-        outcome = np.random.choice(4, p=[0.25]*4)
+        outcome = np.random.choice(8, p=[1/8]*8)
         proj = bell_projs[outcome]
-        
-        # Form full projector for three qubits
-        proj_full = np.kron(proj, np.eye(2))
-        
-        # Project the state
-        system_state = proj_full @ system_state
+        self.logger.debug(f"proj shape: {proj.shape}, system_state shape: {system_state.shape}")
+        system_state = proj @ system_state
         norm = np.linalg.norm(system_state)
         if norm > 0:
             system_state /= norm
-            
-        # Define corrections for Bob's qubit
         corrections = [
-            np.eye(2),                                  # I
-            np.array([[1, 0], [0, -1]]),                # Z
-            np.array([[0, 1], [1, 0]]),                 # X
-            np.array([[0, -1j], [1j, 0]])               # Y
+            np.eye(2),
+            np.array([[1, 0], [0, -1]]),
+            np.array([[0, 1], [1, 0]]),
+            np.array([[0, -1], [1, 0]]),
+            np.eye(2),
+            np.array([[1, 0], [0, -1]]),
+            np.array([[0, 1], [1, 0]]),
+            np.array([[0, -1], [1, 0]])
         ]
-        
-        # Apply correction
-        correction_full = np.kron(np.eye(4), corrections[outcome])
-        system_state = correction_full @ system_state
-        
-        # Extract Bob's state
-        state_2d = system_state.reshape(4, 2)
-        norms = np.linalg.norm(state_2d, axis=1)
-        max_idx = np.argmax(norms)
-        bob_state = state_2d[max_idx, :]
-        norm_bob = norms[max_idx]
-        if norm_bob > 0:
-            bob_state /= norm_bob
-
-        fidelity = np.abs(np.dot(test_state.conj(), bob_state))**2
+        teleported_state = corrections[outcome] @ system_state[:2]
+        norm = np.linalg.norm(teleported_state)
+        if norm > 0:
+            teleported_state /= norm
+        fidelity = np.abs(np.dot(test_state.conj(), teleported_state))**2
         self.teleportation_fidelities.append(fidelity)
         self.negative_energy_measurements.append(np.mean(self.field_registry['negative_flux']['data'][idx2]))
-        return bob_state, fidelity
+        return teleported_state, fidelity
 
     def measure_negative_energy(self):
         negative_energy = []
         for (idx1, idx2) in self.epr_pairs:
             path = self._geodesic_path(idx1, idx2)
             for point in path:
-                if all(0 <= p < s for p, s in zip(point, self.geometry['grids'].shape[:-1])):
-                    energy = self.field_registry['negative_flux']['data'][point]
-                    if energy < 0:
-                        negative_energy.append(energy)
+                energy = self.field_registry['negative_flux']['data'][point]
+                if energy < 0:
+                    negative_energy.append(energy)
         avg_energy = np.mean(negative_energy) if negative_energy else 0
         self.negative_energy_measurements.append(avg_energy)
         return avg_energy
@@ -693,6 +669,7 @@ class AnubisKernel:
         ax.set_zlabel('Z')
         plt.savefig('tetrahedral_network.png')
         plt.close()
+        self.logger.info("Saved tetrahedral network visualization")
 
     def visualize_field_slice(self, field_name, dimension=0, index=0, save_path=None):
         field_data = self.field_registry.get(field_name, {}).get('data')
@@ -701,18 +678,9 @@ class AnubisKernel:
             return
         slice_data = field_data[index] if dimension == 0 else field_data[tuple([slice(None)]*dimension + [index] + [slice(None)]*(len(field_data.shape)-dimension-1))]
         if len(slice_data.shape) > 2:
-            # FIX: Add PCA for high-dimensional data
-            flat_data = slice_data.reshape(-1, slice_data.shape[-1])
-            if flat_data.shape[0] > 1 and flat_data.shape[1] > 1:
-                pca = PCA(n_components=2)
-                reduced = pca.fit_transform(flat_data)
-                slice_data = reduced.reshape(slice_data.shape[:-1] + (2,))
-            slice_data = np.mean(slice_data, axis=-1)
-            
-        # Convert complex data to magnitude for visualization
+            slice_data = np.mean(slice_data, axis=tuple(range(2, len(slice_data.shape))))
         if np.iscomplexobj(slice_data):
-            slice_data = np.abs(slice_data)
-            
+            slice_data = np.abs(slice_data)**2
         plt.figure(figsize=(8, 6))
         plt.imshow(slice_data.T, origin='lower', cmap='viridis')
         plt.colorbar(label=field_name)
@@ -720,6 +688,7 @@ class AnubisKernel:
         if save_path:
             plt.savefig(save_path)
             plt.close()
+            self.logger.info(f"Saved field visualization to {save_path}")
 
     def verify_er_epr_correlation(self):
         correlations = self.measure_entanglement_throat_correlation()
@@ -775,6 +744,31 @@ class AnubisKernel:
         plt.tight_layout()
         plt.savefig('er_epr_verification.png')
         self.logger.info("Saved ER=EPR verification plots to er_epr_verification.png")
+        plt.close()
+
+    def save_checkpoint(self, filename):
+        essential_fields = {
+            'quantum_state': self.field_registry['quantum_state']['data'],
+            'negative_flux': self.field_registry['negative_flux']['data'],
+            'timestep': self.timestep
+        }
+        try:
+            np.savez_compressed(filename, **essential_fields)
+            self.logger.info(f"Saved checkpoint to {filename}")
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {str(e)}")
+
+    def load_checkpoint(self, filename):
+        try:
+            data = np.load(filename)
+            self.field_registry['quantum_state']['data'] = data['quantum_state']
+            self.field_registry['negative_flux']['data'] = data['negative_flux']
+            self.timestep = int(data['timestep'])
+            self.logger.info(f"Loaded checkpoint from {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint: {str(e)}")
+            return False
 
 class TesseractMessenger:
     def __init__(self, anubis_kernel):
@@ -799,39 +793,22 @@ class TesseractMessenger:
 
     def _quantum_encode(self, message):
         try:
-            # Convert message to binary
             binary_msg = ''.join(format(ord(c), '08b') for c in message)
-            
-            # Pad to multiple of 2 bits (since we're encoding 2 bits per qutrit)
-            chunk_size = self.anubis.config['quantum_chunk_size'] * 2
+            chunk_size = self.anubis.config['quantum_chunk_size']
             padded = binary_msg.ljust(chunk_size * ((len(binary_msg) // chunk_size) + 1), '0')
-            
-            # Create qutrits by converting every 2 bits to an integer (0-3)
-            qutrit_indices = [int(padded[i:i+2], 2) for i in range(0, len(padded), 2)]
-            
-            # Map to qutrit states (0,1,2) using modulo 3
-            qutrits = [idx % 3 for idx in qutrit_indices]
-            
-            # Create quantum state with phases
+            qutrits = [int(padded[i:i+2], 2) // 3 for i in range(0, len(padded), 2)]
             state = np.exp(1j * np.array(qutrits) * np.pi / 2, dtype=np.complex64)
             norm = np.linalg.norm(state)
             return state / norm if norm > 0 else state
         except Exception as e:
             self.anubis.logger.error(f"Quantum encoding failed: {e}")
-            return np.zeros(self.anubis.config['quantum_chunk_size'], dtype=np.complex64)
+            return np.zeros(chunk_size, dtype=np.complex64)
 
     def _quantum_decode(self, quantum_state):
         try:
-            # Convert phases to qutrit indices
             angles = np.angle(quantum_state) % (2*np.pi)
-            
-            # Map angles to qutrit indices (0,1,2)
-            qutrits = (angles * 3 / (2*np.pi)).astype(int) % 3
-            
-            # Convert qutrits back to binary
+            qutrits = np.digitize(angles, [np.pi/4, 3*np.pi/4, 5*np.pi/4, 7*np.pi/4]) % 4
             binary = ''.join(['00', '01', '10', '11'][q] for q in qutrits)
-            
-            # Convert binary to characters
             chars = [binary[i:i+8] for i in range(0, len(binary), 8)]
             return ''.join(chr(int(c, 2)) for c in chars if len(c) == 8).split('\x00')[0]
         except Exception as e:
@@ -842,14 +819,34 @@ class TesseractMessenger:
         with self.connection_lock:
             if target_address in self.quantum_channels:
                 return self.quantum_channels[target_address]
-                
-            # Always use fallback for now to avoid size mismatches
-            self.anubis.logger.warning("Using fallback quantum channel")
+            if self.anubis.geometry['tetrahedral_nodes'].size == 0:
+                self.anubis.logger.warning("Empty tetrahedral nodes; using fallback channel")
+                source_state = np.ones(64, dtype=np.complex64) / np.sqrt(64)
+                channel = {
+                    'source_state': source_state,
+                    'target_state': source_state.copy(),
+                    'node_index': 0,
+                    'last_used': time.time()
+                }
+                self.quantum_channels[target_address] = channel
+                return channel
+            target_node = None
+            for i, node in enumerate(self.anubis.geometry['tetrahedral_nodes'].flat):
+                node_hash = hashlib.sha256(node.tobytes()).hexdigest()
+                if node_hash.startswith(target_address[:8]):
+                    target_node = i
+                    break
+            if target_node is None:
+                self.anubis.logger.warning(f"Target {target_address} not found; using fallback")
+                target_node = 0
             source_state = np.ones(64, dtype=np.complex64) / np.sqrt(64)
+            target_state = source_state.copy()
+            source_state = self.anubis.ctc_controller.apply_ctc_feedback(source_state, "future")
+            target_state = self.anubis.ctc_controller.apply_ctc_feedback(target_state, "past")
             channel = {
                 'source_state': source_state,
-                'target_state': source_state.copy(),
-                'node_index': 0,
+                'target_state': target_state,
+                'node_index': target_node,
                 'last_used': time.time()
             }
             self.quantum_channels[target_address] = channel
@@ -859,30 +856,14 @@ class TesseractMessenger:
         try:
             channel = self._create_wormhole_channel(target_address)
             message_state = self._quantum_encode(message)
-            
-            # Ensure message state matches channel state size
-            if len(message_state) != len(channel['source_state']):
-                # Truncate or pad message state to match channel size
-                if len(message_state) < len(channel['source_state']):
-                    padded = np.zeros(len(channel['source_state']), dtype=np.complex64)
-                    padded[:len(message_state)] = message_state
-                    message_state = padded
-                else:
-                    message_state = message_state[:len(channel['source_state'])]
-            
             entangled_state = channel['source_state'] * message_state
             norm = np.linalg.norm(entangled_state)
             if norm > 0:
                 entangled_state /= norm
-                
             node_idx = channel['node_index']
             grid_shape = self.anubis.field_registry['messenger_state']['data'].shape[:-1]
             grid_idx = np.unravel_index(node_idx, grid_shape)
-            
-            # Update only the relevant part of the messenger state
             self.anubis.field_registry['messenger_state']['data'][grid_idx] = entangled_state
-            
-            # Apply CTC feedback
             self.anubis.field_registry['messenger_state']['data'][grid_idx] = (
                 self.anubis.ctc_controller.apply_ctc_feedback(
                     self.anubis.field_registry['messenger_state']['data'][grid_idx], "future"
@@ -936,7 +917,6 @@ class TesseractMessenger:
                 grid_idx = np.unravel_index(i, grid_shape)
                 quantum_state = self.anubis.field_registry['messenger_state']['data'][grid_idx]
                 try:
-                    # Take the real part and convert to bytes
                     key_data = np.real(quantum_state[:32] * 255).astype(np.uint8).tobytes()
                     public_key = ecdsa.VerifyingKey.from_string(key_data, curve=ecdsa.SECP256k1)
                     quantum_hash = hashlib.sha256(key_data).digest()
@@ -954,8 +934,14 @@ class TesseractMessenger:
                 'timestamp': time.time()
             }
             packet_json = json.dumps(connection_packet)
-            target_node = 0  # Always use node 0 for simplicity
-            
+            target_node = None
+            for i, node in enumerate(self.anubis.geometry['tetrahedral_nodes'].flat):
+                node_hash = hashlib.sha256(node.tobytes()).hexdigest()
+                if node_hash.startswith(target_address[:8]):
+                    target_node = i
+                    break
+            if target_node is None:
+                target_node = 0
             key_bytes = self.public_key.to_string()
             key_state = np.zeros(64, dtype=np.complex64)
             max_bytes = 32
@@ -970,8 +956,10 @@ class TesseractMessenger:
                 key_state /= norm
             else:
                 key_state = np.ones(64, dtype=np.complex64) / np.sqrt(64)
-                
             grid_shape = self.anubis.field_registry['messenger_state']['data'].shape[:-1]
+            if target_node >= np.prod(grid_shape):
+                self.anubis.logger.warning(f"Target node {target_node} out of bounds; using 0")
+                target_node = 0
             grid_idx = np.unravel_index(target_node, grid_shape)
             self.anubis.field_registry['messenger_state']['data'][grid_idx] = key_state
             self.anubis.field_registry['holographic_density']['data'].flat[target_node] = 2.0
@@ -1024,7 +1012,7 @@ class Unified6DSimulation(AnubisKernel):
         self.time = 0.0
         self.wormhole_nodes = self.geometry['wormhole_nodes']
         self.num_nodes = 4
-        self.dim_per_node = 3 ** CONFIG["num_qutrits_per_node"]
+        self.dim_per_node = 81
         self.ctc_total_dim = self.num_nodes * self.dim_per_node
         self.stress_energy = self._initialize_stress_energy()
         self.ctc_state = np.zeros(self.ctc_total_dim, dtype=np.complex64)
@@ -1072,14 +1060,14 @@ class Unified6DSimulation(AnubisKernel):
 
     def simulate_ctc_quantum_circuit(self):
         try:
-            num_qutrits_per_node = int(CONFIG.get('num_qutrits_per_node', 1))
+            num_qutrits_per_node = int(CONFIG.get('num_qutrits_per_node', 4))
             self.logger.debug(f"num_qutrits_per_node: {num_qutrits_per_node}")
             num_nodes = self.num_nodes
             try:
                 dim_per_node = int(3 ** num_qutrits_per_node)
             except (TypeError, ValueError) as e:
                 self.logger.error(f"Failed to compute dim_per_node: {e}")
-                dim_per_node = 3
+                dim_per_node = 81
             self.logger.debug(f"dim_per_node: {dim_per_node}")
             total_dim = dim_per_node * num_nodes
             initial_state = np.random.normal(0, 1, total_dim) + 1j * np.random.normal(0, 1, total_dim)
@@ -1121,38 +1109,41 @@ class Unified6DSimulation(AnubisKernel):
                 chnot_single = U @ Vt
                 return csc_matrix(chnot_single)
 
-            # Only apply for qutrit systems with >1 qutrit
-            if num_qutrits_per_node > 1:
-                chnot_op = qutrit_chnot()
-                for _ in range(num_qutrits_per_node - 2):
-                    chnot_op = kron(chnot_op, eye(3, dtype=np.complex64))
-                for node_idx in range(num_nodes):
-                    start_idx = node_idx * dim_per_node
-                    end_idx = start_idx + dim_per_node
-                    node_state = chnot_op @ state[start_idx:end_idx]
-                    if np.any(np.isnan(node_state)):
-                        node_state = np.exp(1j * np.random.uniform(0, 2*np.pi, dim_per_node)) / np.sqrt(dim_per_node)
-                    norm = np.linalg.norm(node_state)
-                    if norm > 0:
-                        node_state /= norm
-                    state[start_idx:end_idx] = node_state
-                norm = np.linalg.norm(state)
+            chnot_op = qutrit_chnot()
+            for _ in range(num_qutrits_per_node - 2):
+                chnot_op = kron(chnot_op, eye(3, dtype=np.complex64))
+            for node_idx in range(num_nodes):
+                start_idx = node_idx * dim_per_node
+                end_idx = start_idx + dim_per_node
+                node_state = chnot_op @ state[start_idx:end_idx]
+                if np.any(np.isnan(node_state)):
+                    node_state = np.exp(1j * np.random.uniform(0, 2*np.pi, dim_per_node)) / np.sqrt(dim_per_node)
+                norm = np.linalg.norm(node_state)
                 if norm > 0:
-                    state /= norm
+                    node_state /= norm
+                state[start_idx:end_idx] = node_state
+            norm = np.linalg.norm(state)
+            if norm > 0:
+                state /= norm
 
             def pairwise_cphase():
                 pair_dim = 2 * dim_per_node
-                data = np.exp(2j * np.pi * (np.mod(np.arange(pair_dim), dim_per_node) / 3.0))
+                self.logger.debug(f"pair_dim: {pair_dim}")
+                if not isinstance(dim_per_node, int):
+                    self.logger.error(f"Invalid dim_per_node type: {type(dim_per_node)}")
+                    raise TypeError(f"Invalid dim_per_node type: {type(dim_per_node)}")
+                mod_result = np.mod(np.arange(pair_dim, dtype=np.int64), int(dim_per_node))
+                data = np.exp(6j * np.pi * (mod_result // 3).astype(np.int64))
                 return csc_matrix((data, (np.arange(pair_dim), np.arange(pair_dim))), shape=(pair_dim, pair_dim))
 
             def pairwise_cz():
                 pair_dim = 2 * dim_per_node
-                data = np.where(np.mod(np.arange(pair_dim), dim_per_node) == 2, -1, 1)
+                data = np.where(np.mod(np.arange(pair_dim, dtype=np.int64), dim_per_node) == 2, -1, 1)
                 return csc_matrix((data, (np.arange(pair_dim), np.arange(pair_dim))), shape=(pair_dim, pair_dim))
 
             def pairwise_swap():
                 pair_dim = 2 * dim_per_node
-                indices = np.arange(pair_dim)
+                indices = np.arange(pair_dim, dtype=np.int64)
                 node_idx = indices // dim_per_node
                 state_idx = np.mod(indices, dim_per_node)
                 swap_i = (1 - node_idx) * dim_per_node + state_idx
@@ -1177,23 +1168,23 @@ class Unified6DSimulation(AnubisKernel):
             for node_idx in range(num_nodes - 1):
                 start1 = node_idx * dim
                 start2 = start1 + dim
-                
-                # FIX: Handle state dimensions properly
-                sub_state = np.concatenate([state[start1:start1+dim], state[start2:start2+dim]])
-                if len(sub_state) == 6:  # 1 qutrit per node (3 + 3 states)
-                    # Handle 1-qutrit Bell state properly
-                    sub_state = sub_state.reshape(2, 3)
-                    probs = np.abs(sub_state)**2
-                    bell_probs.append(np.max(probs))
+                sub_state = np.concatenate([state[start1:start2], state[start2:start2 + dim]]).reshape(18, 9)
+                sub_norm = np.linalg.norm(sub_state)
+                if sub_norm > 1e-10:
+                    sub_state /= sub_norm
                 else:
-                    # Original handling for higher dimensions
-                    sub_state = sub_state.reshape(2*dim, dim)
-                    sub_norm = np.linalg.norm(sub_state)
-                    if sub_norm > 1e-10:
-                        sub_state /= sub_norm
-                    probs = np.abs(sub_state)**2
-                    bell_probs.append(np.max(probs))
-                    
+                    sub_state = np.ones((18, 9), dtype=np.complex64) / np.sqrt(18 * 9)
+                bell_basis = np.zeros((9, 9), dtype=np.complex64)
+                for i in range(3):
+                    for j in range(3):
+                        idx = i * 3 + j
+                        bell_basis[idx, idx] = 1.0 / np.sqrt(3)
+                        bell_basis[idx, (i * 3 + (j + 1) % 3)] = np.exp(2j * np.pi * i / 3) / np.sqrt(3)
+                        bell_basis[idx, (i * 3 + (j + 2) % 3)] = np.exp(4j * np.pi * i / 3) / np.sqrt(3)
+                bell_basis = csc_matrix(bell_basis)
+                sub_state = bell_basis @ sub_state.ravel()
+                probs = np.abs(sub_state)**2
+                bell_probs.append(np.max(probs))
             teleport_prob = np.mean(bell_probs) if bell_probs else np.max(np.abs(state)**2)
             state *= np.exp(1j * np.pi * teleport_prob)
             norm = np.linalg.norm(state)
@@ -1213,20 +1204,7 @@ class Unified6DSimulation(AnubisKernel):
                 for _ in range(1, num_qutrits_per_node):
                     node_act2_block = kron(node_act2_block, act2_matrix)
                 act2_blocks.append(node_act2_block.toarray())
-                
-            # FIX: Proper block matrix construction
-            block_list = []
-            for i in range(len(act2_blocks)):
-                row = []
-                for j in range(len(act2_blocks)):
-                    if i == j:
-                        row.append(act2_blocks[i])
-                    else:
-                        row.append(np.zeros_like(act2_blocks[i]))
-                block_list.append(row)
-            block_matrix = np.block(block_list)
-            act2_op = csc_matrix(block_matrix)
-
+            act2_op = csc_matrix(np.block([[block if i == j else np.zeros_like(block) for j in range(len(act2_blocks))] for i in range(len(act2_blocks))]))
             state = act2_op @ state
             norm = np.linalg.norm(state)
             if norm > 0:
@@ -1256,22 +1234,11 @@ class Unified6DSimulation(AnubisKernel):
         scaling_factor = np.float32((1 + np.sqrt(5)) / 2)
         a = self.config['a_godel']
         kappa = self.config['kappa']
-        
-        # FIX: Create KDTree to map tetrahedral nodes to grid points
-        grid_points = self.geometry['grids'].reshape(-1, 6)
-        tree = cKDTree(grid_points)
-        
-        # FIX: Get curvature values from the grid
-        curvature_term = kappa * self.field_registry['negative_flux']['data']
-        curvature_flat = curvature_term.reshape(-1)
-        
+        phi_N = np.clip(np.mean(self.field_registry['nugget']['data']),
+                        -self.config["field_clamp_max"], self.config["field_clamp_max"])
         n_points = min(self.total_points, coords.shape[0])
         self.logger.debug(f"Computing metric tensor for {n_points} points")
         for i in range(n_points):
-            # FIX: Find the closest grid point to the tetrahedral node
-            dist, idx = tree.query(coords[i])
-            curvature_val = curvature_flat[idx]
-            
             r_spatial = np.sqrt(coords[i,1]**2 + coords[i,2]**2 + coords[i,3]**2 + 1e-10)
             theta_i = np.arccos(coords[i,3] / r_spatial) if r_spatial > 0 else 0
             c_prime_i = self.c * (1 - (44 * (1/137)**2 * self.hbar**2 * self.c**2) /
@@ -1279,11 +1246,9 @@ class Unified6DSimulation(AnubisKernel):
             b_r = r_0**2 / r_spatial if r_spatial > r_0 else r_0
             wormhole_factor = 1 / np.maximum(np.float32(0.01), 1 - b_r / r_spatial)
             time_factor = 1 + np.float32(500.0) * np.sin(self.time * self.config["omega"])
-            
-            # FIX: Use scalar curvature value
-            g_numeric[i,0,0] = scaling_factor * (-c_prime_i**2 * (1 + curvature_val * time_factor))
+            g_numeric[i,0,0] = scaling_factor * (-c_prime_i**2 * (1 + kappa * phi_N * time_factor))
             g_numeric[i,0,3] = g_numeric[i,3,0] = scaling_factor * (a * c_prime_i * np.exp(r_spatial / a))
-            spatial_term = scaling_factor * (a**2 * np.exp(2 * r_spatial / a) * wormhole_factor * (1 + curvature_val))
+            spatial_term = scaling_factor * (a**2 * np.exp(2 * r_spatial / a) * wormhole_factor * (1 + kappa * phi_N))
             g_numeric[i,1:4,1:4] = np.eye(3, dtype=np.float32) * spatial_term
             g_numeric[i,4:6,4:6] = np.eye(2, dtype=np.float32) * scaling_factor * self.l_p**2
         return np.clip(g_numeric, -self.config["field_clamp_max"], self.config["field_clamp_max"])
@@ -1301,7 +1266,7 @@ class Unified6DSimulation(AnubisKernel):
 
     def compute_time_displacement(self, u_entry, u_exit, v=0):
         C = np.float32(2.0)
-        alpha_time = self.config['alpha_time']
+        alpha_time = self.config["alpha_time"]
         c_effective = self.c
         t_entry = alpha_time * 2 * np.pi * C * np.cosh(v) * np.sin(u_entry) / c_effective
         t_exit = alpha_time * 2 * np.pi * C * np.cosh(v) * np.sin(u_exit) / c_effective
@@ -1324,82 +1289,6 @@ class Unified6DSimulation(AnubisKernel):
         eigenvalues = np.linalg.eigvalsh(A)
         return np.sum(np.abs(eigenvalues))
 
-    def run_simulation(self):
-        self.logger.info("Starting simulation")
-        try:
-            self.visualize_tetrahedral_network()
-            alice_address = self.alice.get_quantum_address()
-            bob_address = self.bob.get_quantum_address()
-            self.alice.initiate_connection(bob_address)
-            time.sleep(0.5)
-            print("Time | Nugget | Past | Future | Entropy | g_tt | Throat | Fidelity")
-            for iteration in range(self.config["max_iterations"]):
-                self.time += self.dt
-                self.evolve_system(self.dt)
-                nugget_mean = np.mean(self.field_registry['nugget']['data'])
-                for i in range(self.total_points):
-                    self.stress_energy[i,0,0] += -nugget_mean * self.config["kappa"]
-                past_result = self.transmit_and_compute(1010, direction="past", target_dt=-2*self.dt)
-                future_result = self.transmit_and_compute(1010, direction="future", target_dt=2*self.dt)
-                decision = self.simulate_ctc_quantum_circuit()
-                entanglement = np.mean(self.field_registry['entanglement']['data'])
-                g_numeric = self.compute_metric_tensor()
-                g_tt_mean = np.mean(g_numeric[:, 0, 0])
-                test_state = np.array([1, 0], dtype=np.complex64) / np.sqrt(2)
-                _, fidelity = self.teleport_through_wormhole(test_state)
-                throat_area = np.mean(list(self.wormhole_throat_areas.values())) if self.wormhole_throat_areas else 0.0
-                self.measure_negative_energy()
-                self.throat_area_history.append(throat_area)
-                self.fidelity_history.append(fidelity)
-                self.metric_history.append(g_numeric)
-                self.history.append(self.time)
-                self.result_history.append((past_result, future_result))
-                self.entanglement_history.append(entanglement)
-                print(f"{self.time:.2e} | {nugget_mean:.2e} | {past_result:.2e} | {future_result:.2e} | {entanglement:.2f} | {g_tt_mean:.2e} | {throat_area:.2e} | {fidelity:.2f}")
-                if iteration % 5 == 0:
-                    message = self.alice.sign_message(f"Iteration {iteration} at {self.time:.2e}")
-                    self.alice.send_message(bob_address, message)
-                    try:
-                        _, received = self.bob.receive_message(timeout=0.5)
-                        response = self.bob.sign_message(f"Received at {iteration}")
-                        self.bob.send_message(alice_address, response)
-                        _, _ = self.alice.receive_message(timeout=0.5)
-                    except:
-                        self.logger.warning(f"Message exchange failed at iteration {iteration}")
-                    self.visualize_field_slice('quantum_state', save_path=f'quantum_state_t{iteration}.png')
-                    self.visualize_field_slice('nugget', dimension=1, index=1, save_path=f'nugget_x1_t{iteration}.png')
-                    self.visualize_field_slice('holographic_density', save_path=f'holographic_density_t{iteration}.png')
-                    self.save_checkpoint(f"checkpoint_step_{iteration}.npz")
-            print("\nFinal Summary:")
-            print(f"Time: {self.time:.2e}")
-            print(f"Nugget Mean: {np.mean([np.mean(self.field_registry['nugget']['data']) for _ in self.history]):.2e}")
-            print(f"Past Result: {np.mean([r[0] for r in self.result_history]):.2e}")
-            print(f"Future Result: {np.mean([r[1] for r in self.result_history]):.2e}")
-            print(f"Entanglement: {np.mean(self.entanglement_history):.2f}")
-            print(f"g_tt: {np.mean(self.metric_history[-1][:, 0, 0]):.2e}")
-            print(f"Throat Area: {np.mean(self.throat_area_history):.2e}")
-            print(f"Fidelity: {np.mean(self.fidelity_history):.2f}")
-            plt.figure(figsize=(10, 6))
-            plt.subplot(2, 1, 1)
-            plt.plot(self.history, self.entanglement_history, '-o', label='Entropy')
-            plt.plot(self.history, [np.mean(g[:, 0, 0]) for g in self.metric_history], '-o', label='g_tt')
-            plt.legend()
-            plt.xlabel('Time (s)')
-            plt.subplot(2, 1, 2)
-            plt.plot(self.history, self.throat_area_history, '-o', label='Throat Area')
-            plt.plot(self.history, self.fidelity_history, '-o', label='Fidelity')
-            plt.legend()
-            plt.xlabel('Time (s)')
-            plt.tight_layout()
-            plt.savefig('simulation_results.png')
-            plt.close()
-            self.verify_er_epr_correlation()
-            self.visualize_wormhole_geometry()
-            self.save_checkpoint("final_checkpoint.npz")
-        except Exception as e:
-            self.logger.error(f"Simulation failed: {e}")
-            raise
-
     def save_checkpoint(self, filename):
         essential_fields = {
             'quantum_state': self.field_registry['quantum_state']['data'],
@@ -1407,44 +1296,152 @@ class Unified6DSimulation(AnubisKernel):
             'timestep': self.timestep,
             'time': self.time
         }
-        np.savez_compressed(filename, **essential_fields)
-        self.logger.info(f"Saved checkpoint to {filename}")
+        try:
+            np.savez_compressed(filename, **essential_fields)
+            self.logger.info(f"Saved checkpoint to {filename}")
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {str(e)}")
 
-    def visualize_wormhole_geometry(self, pair_index=0):
-        if not self.epr_pairs:
-            self.logger.warning("No EPR pairs initialized")
-            return
-        idx1, idx2 = self.epr_pairs[pair_index]
-        path = self._geodesic_path(idx1, idx2)
+    def load_checkpoint(self, filename):
+        try:
+            data = np.load(filename)
+            self.field_registry['quantum_state']['data'] = data['quantum_state']
+            self.field_registry['negative_flux']['data'] = data['negative_flux']
+            self.timestep = int(data['timestep'])
+            self.time = float(data['time'])
+            self.logger.info(f"Loaded checkpoint from {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint: {str(e)}")
+            return False
+
+    def plot_wormhole_geometry(self):
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
-        coords = [self.geometry['grids'][p] for p in path]
-        x = [c[1] for c in coords]
-        y = [c[2] for c in coords]
-        z = [c[3] for c in coords]
-        ax.plot(x, y, z, 'b-', linewidth=2, label='Wormhole Throat')
-        ax.scatter([x[0], x[-1]], [y[0], y[-1]], [z[0], z[-1]], 
-                   c=['r', 'g'], s=100, label=['EPR Particle A', 'EPR Particle B'])
-        flux = [self.field_registry['negative_flux']['data'][p] for p in path]
-        colors = plt.cm.viridis((np.array(flux) - min(flux)) / (max(flux) - min(flux)))
-        for i in range(len(x)-1):
-            ax.plot(x[i:i+2], y[i:i+2], z[i:i+2], color=colors[i], linewidth=3)
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m)')
-        ax.set_title('ER Bridge Connecting EPR Pair')
+        for (idx1, idx2) in self.epr_pairs:
+            coord1 = self.geometry['grids'][idx1][:3]
+            coord2 = self.geometry['grids'][idx2][:3]
+            ax.plot([coord1[0], coord2[0]], [coord1[1], coord2[1]], [coord1[2], coord2[2]], 'b-', alpha=0.5)
+        ax.scatter(self.geometry['wormhole_nodes'][:, 1], self.geometry['wormhole_nodes'][:, 2], self.geometry['wormhole_nodes'][:, 3], c='r', s=50, label='Wormhole Nodes')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
         ax.legend()
-        entropy = self.calculate_entanglement_entropy(idx1, idx2)
-        throat_area = self.wormhole_throat_areas.get((idx1, idx2), self._calculate_throat_area(idx1, idx2))
-        plt.figtext(0.5, 0.02, 
-                    f"Entanglement Entropy: {entropy:.4f} | Throat Area: {throat_area:.4e} m² | "
-                    f"ER=EPR Ratio: {throat_area/(4*self.G*self.hbar/self.c**3*entropy):.6f}",
-                    ha='center')
         plt.savefig('wormhole_geometry.png')
-        self.logger.info("Saved wormhole geometry visualization to wormhole_geometry.png")
         plt.close()
+        self.logger.info("Saved wormhole geometry visualization to wormhole_geometry.png")
 
-if __name__ == "__main__":
-    validate_config(CONFIG)
-    sim = Unified6DSimulation()
-    sim.run_simulation()
+    def plot_simulation_results(self):
+        plt.figure(figsize=(15, 10))
+        plt.subplot(2, 2, 1)
+        plt.plot([h['time'] for h in self.history], [h['nugget_mean'] for h in self.history], label='Nugget Mean')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Nugget Value')
+        plt.title('Nugget Evolution')
+        plt.grid(True)
+        plt.legend()
+        plt.subplot(2, 2, 2)
+        plt.plot([h['time'] for h in self.history], [h['entropy_mean'] for h in self.history], label='Entropy Mean')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Entanglement Entropy')
+        plt.title('Entanglement Entropy')
+        plt.grid(True)
+        plt.legend()
+        plt.subplot(2, 2, 3)
+        plt.plot([h['time'] for h in self.history], [h['g_tt_mean'] for h in self.history], label='g_tt Mean')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Metric g_tt')
+        plt.title('Metric Tensor g_tt')
+        plt.grid(True)
+        plt.legend()
+        plt.subplot(2, 2, 4)
+        plt.plot([h['time'] for h in self.history], [h['throat_mean'] for h in self.history], label='Throat Area Mean')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Throat Area (m²)')
+        plt.title('Wormhole Throat Area')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('simulation_results.png')
+        plt.close()
+        self.logger.info("Saved simulation results plot to simulation_results.png")
+
+    def run_simulation(self, checkpoint_path=None):
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            if not self.load_checkpoint(checkpoint_path):
+                self.logger.error("Failed to load checkpoint; starting fresh")
+                self.timestep = 0
+                self.time = 0.0
+        self.logger.info("Starting 6D CSA spacetime simulation")
+        self.visualize_tetrahedral_network()
+        self.alice.initiate_connection(self.bob.get_quantum_address())
+        self.bob.initiate_connection(self.alice.get_quantum_address())
+        time.sleep(1)  # Allow connection establishment
+        test_state = np.array([1, 0], dtype=np.complex64) / np.sqrt(2)
+        print(f"{'Iter':<6} {'Time':<12} {'Nugget':<12} {'Past':<12} {'Future':<12} {'Entropy':<12} {'g_tt':<12} {'Throat':<12} {'Fidelity':<12}")
+        for i in range(self.timestep, self.config['max_iterations']):
+            start_time = time.time()
+            self.evolve_system(self.dt)
+            self.time += self.dt
+            if self.epr_pairs:
+                idx1, idx2 = self.epr_pairs[0]
+                entropy = self.calculate_entanglement_entropy(idx1, idx2)
+                throat_area = self.wormhole_throat_areas.get((idx1, idx2), 0)
+                _, fidelity = self.teleport_through_wormhole(test_state)
+            else:
+                entropy, throat_area, fidelity = 0, 0, 0
+            metric = self.compute_metric_tensor()
+            g_tt_mean = np.mean(metric[:, 0, 0])
+            nugget_mean = np.mean(self.field_registry['nugget']['data'])
+            past_phase = np.abs(self.ctc_controller.phase_past)
+            future_phase = np.abs(self.ctc_controller.phase_future)
+            self.history.append({
+                'time': self.time,
+                'nugget_mean': nugget_mean,
+                'entropy_mean': entropy,
+                'g_tt_mean': g_tt_mean,
+                'throat_mean': throat_area,
+                'fidelity': fidelity
+            })
+            self.entanglement_history.append(entropy)
+            self.metric_history.append(g_tt_mean)
+            self.throat_area_history.append(throat_area)
+            self.fidelity_history.append(fidelity)
+            print(f"{i:<6} {self.time:<12.2e} {nugget_mean:<12.2e} {past_phase:<12.2e} {future_phase:<12.2e} {entropy:<12.2e} {g_tt_mean:<12.2e} {throat_area:<12.2e} {fidelity:<12.2e}")
+            if i % 5 == 0:
+                self.alice.send_message(self.bob.get_quantum_address(), self.alice.sign_message(f"Hello from Alice at t={self.time:.2e}"))
+                try:
+                    sender, msg = self.bob.receive_message(timeout=0.1)
+                    self.logger.info(f"Bob received: {msg} from {sender}")
+                    self.bob.send_message(self.alice.get_quantum_address(), self.bob.sign_message(f"Hi Alice, got your msg at t={self.time:.2e}"))
+                except:
+                    pass
+                try:
+                    sender, msg = self.alice.receive_message(timeout=0.1)
+                    self.logger.info(f"Alice received: {msg} from {sender}")
+                except:
+                    pass
+                self.visualize_field_slice('quantum_state', save_path=f'quantum_state_t{i}.png')
+                self.visualize_field_slice('nugget', save_path=f'nugget_t{i}.png')
+                self.visualize_field_slice('holographic_density', save_path=f'holographic_density_t{i}.png')
+                self.save_checkpoint(f'checkpoint_iter{i}.npz')
+            computation_time = time.time() - start_time
+            self.logger.debug(f"Iteration {i} took {computation_time:.2f} seconds")
+        self.verify_er_epr_correlation()
+        self.plot_wormhole_geometry()
+        self.plot_simulation_results()
+        self.save_checkpoint('final_checkpoint.npz')
+        avg_nugget = np.mean([h['nugget_mean'] for h in self.history])
+        avg_entropy = np.mean(self.entanglement_history)
+        avg_g_tt = np.mean(self.metric_history)
+        avg_throat = np.mean(self.throat_area_history)
+        avg_fidelity = np.mean(self.fidelity_history)
+        self.logger.info("\n" + "="*60)
+        self.logger.info("SIMULATION SUMMARY")
+        self.logger.info("="*60)
+        self.logger.info(f"Average Nugget Value: {avg_nugget:.4e}")
+        self.logger.info(f"Average Entanglement Entropy: {avg_entropy:.4e}")
+        self.logger.info(f"Average Metric g_tt: {avg_g_tt:.4e}")
+        self.logger.info(f"Average Throat Area: {avg_throat:.4e} m²")
+        self.logger.info(f"Average Teleportation Fidelity: {avg_fidelity:.4f}")
+        self.logger.info("Simulation completed successfully")
